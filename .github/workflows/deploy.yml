@@ -1,4 +1,3 @@
-
 name: Deploy Cloudflare Worker
 
 on:
@@ -10,7 +9,6 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     name: Build & Deploy
-
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -20,6 +18,7 @@ jobs:
         with:
           node-version: 20
 
+      # Change 'npm ci' to 'npm install'
       - name: Install Dependencies
         run: npm install
 
@@ -27,6 +26,15 @@ jobs:
         run: |
           sed -i 's/D1_DATABASE_ID_PLACEHOLDER/${{ secrets.D1_DATABASE_ID }}/g' wrangler.toml
 
+      - name: Install Dependencies
+        run: npm ci
+
+      # 🔒 Safely replace database_id in wrangler.toml during CI run only
+      - name: Inject D1 Database ID
+        run: |
+          sed -i 's/D1_DATABASE_ID_PLACEHOLDER/${{ secrets.D1_DATABASE_ID }}/g' wrangler.toml
+
+      # 🚀 Deploy worker and pass secrets
       - name: Deploy Worker
         uses: cloudflare/wrangler-action@v3
         with:
