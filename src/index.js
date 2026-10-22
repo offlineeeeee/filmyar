@@ -1,0 +1,240 @@
+import {
+  ensureTables,
+  getMovieById,
+  searchMovies,
+  dbFavToggle,
+  dbHistoryAdd,
+  dbTrack,
+  dbGetFavList,
+  dbGetHistoryList,
+  dbGetRandom
+} from './db/database.js';
+import { fetchImdbMediaList } from './services/tmdb.js';
+import { handleTelegramUpdate } from './telegram/bot.js';
+import { renderWebApp } from './views/webApp.js';
+import { verifyTelegramAuth } from './utils/helpers.js';
+import { dbUserSync } from './db/database.js';
+import { dbCreateAuthSession, dbGetAuthSession } from './db/database.js';
+
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+
+    // 1. Mini App HTML
+    if (request.method === 'GET' && url.pathname === '/') {
+      return new Response(renderWebApp(env.BOT_USERNAME, env.TMDB_API_KEY), {
+        headers: { 'Content-Type': 'text/html;charset=UTF-8' }
+      });
+    }
+
+    // 1. Standalone Telegram Bot Login Handlers
+    if (request.method === 'POST' && url.pathname === '/api/auth/init') {
+      const sessionId = crypto.randomUUID().replace(/-/g, '').substring(0, 16);
+      if (env.DB) {
+        await dbCreateAuthSession(env.DB, sessionId);
+      }
+      return new Response(JSON.stringify({
+        ok: true,
+        sessionId,
+        botUrl: `https://t.me/${env.BOT_USERNAME}?start=auth_${sessionId}`
+      }), {
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+      });
+    }
+
+    if (request.method === 'GET' && url.pathname === '/api/auth/check') {
+      const sessionId = url.searchParams.get('id');
+      if (!sessionId || !env.DB) {
+        return new Response(JSON.stringify({ ok: false }), {
+          headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+        });
+      }
+
+      const session = await dbGetAuthSession(env.DB, sessionId);
+      if (session && session.status === 'approved' && session.user_data) {
+        let user = null;
+        try { user = JSON.parse(session.user_data); } catch {}
+        return new Response(JSON.stringify({ ok: true, approved: true, user }), {
+          headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+        });
+      }
+
+      return new Response(JSON.stringify({ ok: true, approved: false }), {
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+      });
+    }
+
+    // Standalone Telegram Auth Callback (POST)
+    if (request.method === 'POST' && url.pathname === '/api/auth/telegram') {
+      try {
+        const authData = await request.json();
+        const isValid = await verifyTelegramAuth(authData, env.BOT_TOKEN);
+
+        if (!isValid) {
+          return new Response(JSON.stringify({ ok: false, error: 'Invalid authentication signature' }), {
+            status: 401,
+            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+          });
+        }
+
+        if (env.DB) {
+          await dbUserSync(env.DB, Number(authData.id), authData.username, authData.first_name);
+        }
+
+        return new Response(JSON.stringify({ ok: true, user: authData }), {
+          headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ ok: false, error: 'Auth failed' }), {
+          status: 400,
+          headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+        });
+      }
+    }
+
+    // 2. REST API Endpoints for Mini App
+    if (request.method === 'GET' && url.pathname.startsWith('/api/')) {
+      const action = url.pathname.replace('/api/', '');
+      const page = parseInt(url.searchParams.get('page'), 10) || 1;
+      const uid = url.searchParams.get('uid');
+      const q = url.searchParams.get('q');
+      const id = url.searchParams.get('id');
+
+      try {
+        if (action === 'random') {
+          const rnd = await dbGetRandom(env.DB);
+          return new Response(JSON.stringify(rnd ? [rnd] : []), {
+            headers: {
+              'Content-Type': 'application/json',
+              'Access-Control-Allow-Origin': '*',
+              'Cache-Control': 'public, max-age=60, s-maxage=180'
+            }
+          });
+        }
+
+        if (action === 'get') {
+          const item = await getMovieById(env.DB, id, env);
+          return new Response(JSON.stringify(item), {
+            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+          });
+        }
+
+        if (action === 'search') {
+          const results = await searchMovies(env.DB, q, env);
+          return new Response(JSON.stringify(results), {
+            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+          });
+        }
+
+        if (action === 'trending') {
+          const list = await fetchImdbMediaList('trending', page, env.DB, 12, env.TMDB_API_KEY);
+          return new Response(JSON.stringify(list), {
+            headers: {
+              'Content-Type': 'application/json',
+              'Access-Control-Allow-Origin': '*',
+              'Cache-Control': 'public, max-age=180, s-maxage=600'
+            }
+          });
+        }
+
+        const genre = url.searchParams.get('genre') || '';
+
+        if (action === 'movies') {
+          const list = await fetchImdbMediaList('movie', page, env.DB, 12, env.TMDB_API_KEY, genre);
+          return new Response(JSON.stringify(list), {
+            headers: {
+              'Content-Type': 'application/json',
+              'Access-Control-Allow-Origin': '*',
+              'Cache-Control': 'public, max-age=180, s-maxage=600'
+            }
+          });
+        }
+
+        if (action === 'series') {
+          const list = await fetchImdbMediaList('series', page, env.DB, 12, env.TMDB_API_KEY, genre);
+          return new Response(JSON.stringify(list), {
+            headers: {
+              'Content-Type': 'application/json',
+              'Access-Control-Allow-Origin': '*',
+              'Cache-Control': 'public, max-age=180, s-maxage=600'
+            }
+          });
+        }
+
+        if (action === 'top') {
+          const type = url.searchParams.get('type') || 'movie';
+          const list = await fetchImdbMediaList(type === 'series' ? 'top_series' : 'top_movie', page, env.DB, 12, env.TMDB_API_KEY);
+          return new Response(JSON.stringify(list), {
+            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+          });
+        }
+
+        if (action === 'fav_toggle') {
+          const mid = url.searchParams.get('mid');
+          const res = await dbFavToggle(env.DB, uid, mid);
+          return new Response(JSON.stringify(res), {
+            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+          });
+        }
+
+        if (action === 'favs') {
+          const favs = await dbGetFavList(env.DB, uid);
+          const start = (page - 1) * 12;
+          return new Response(JSON.stringify(favs.slice(start, start + 12)), {
+            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+          });
+        }
+
+        if (action === 'history') {
+          const hist = await dbGetHistoryList(env.DB, uid);
+          const start = (page - 1) * 12;
+          return new Response(JSON.stringify(hist.slice(start, start + 12)), {
+            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+          });
+        }
+
+        if (action === 'history_add') {
+          const mid = url.searchParams.get('mid');
+          const res = await dbHistoryAdd(env.DB, uid, mid);
+          return new Response(JSON.stringify(res), {
+            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+          });
+        }
+
+        if (action === 'track') {
+          const res = await dbTrack(env.DB, id);
+          return new Response(JSON.stringify(res), {
+            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+          });
+        }
+
+        return new Response('[]', {
+          headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+        });
+      } catch (err) {
+        return new Response('[]', {
+          headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+        });
+      }
+    }
+
+    // 3. Telegram Webhook (POST)
+    if (request.method === 'POST' && url.pathname !== '/api/auth/telegram') {
+      try {
+        const update = await request.json();
+        ctx.waitUntil((async () => {
+          try {
+            await handleTelegramUpdate(update, env, ctx);
+          } catch (err) {
+            console.error('Webhook execution failure:', err);
+          }
+        })());
+      } catch (err) {
+        console.error('Failed to parse incoming webhook payload:', err);
+      }
+      return new Response('OK', { status: 200 });
+    }
+
+    return new Response('Bot is running', { status: 200 });
+  }
+};
